@@ -14,7 +14,7 @@ from skimage.segmentation import slic
 from sklearn.neighbors import NearestCentroid
 
 # ================== FastAPI ==================
-app = FastAPI(title="Car Color API", version="0.3.0")
+app = FastAPI(title="Car Color API", version="0.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -196,7 +196,7 @@ async def grow_similar(
 
     return {"mask_png_base64": mask_to_png_base64(kept)}
 
-# ================== /sam_point (AI через Replicate) ==================
+# ================== /sam_point (AI через Replicate: upload file) ==================
 @app.post("/sam_point")
 async def sam_point(
     image: UploadFile = File(...),
@@ -205,16 +205,15 @@ async def sam_point(
     multimask: int = Form(0),
 ):
     """
-    SAM через Replicate без /v1/files:
-    відправляємо зображення як data URL (base64). Є ретраї на 502/429.
-    Потрібна змінна середовища REPLICATE_API_TOKEN.
+    SAM через Replicate. Відправляємо PNG як файл через /v1/files (правильний upload),
+    далі запускаємо предікшн. Є ретраї на 502/429. Потрібна REPLICATE_API_TOKEN.
     """
     token = os.environ.get("REPLICATE_API_TOKEN")
     if not token:
         return {"error": "Missing REPLICATE_API_TOKEN (Render → Settings → Environment)"}
 
     try:
-        # 1) Зчитати, зменшити (макс 1280px), закодувати в data URL
+        # 1) Зчитати зображення, зменшити до макс 1280px, зберегти в буфер PNG
         raw = image.file.read()
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         W, H = im.size
@@ -224,15 +223,33 @@ async def sam_point(
             im = im.resize((int(W*scale), int(H*scale)), Image.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, format="PNG")
-        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+        buf.seek(0)  # обов'язково перед відправкою
     except Exception as e:
         return {"error": f"Bad image: {e}"}
 
-    # 2) Запуск предікшна
+    # 2) Upload у Replicate (правильний files=..., щоб не було 'Missing content')
+    try:
+        files = {"file": ("image.png", buf, "image/png")}
+        up = requests.post(
+            "https://api.replicate.com/v1/files",
+            headers={"Authorization": f"Token {token}"},
+            files=files,
+            timeout=120,
+        )
+        if not up.ok:
+            return {"error": f"Replicate file upload failed: {up.status_code} {up.text}"}
+        rj = up.json()
+        img_url = rj.get("url")
+        if not img_url:
+            return {"error": f"Replicate file upload returned no URL: {rj}"}
+    except Exception as e:
+        return {"error": f"Upload to Replicate failed: {e}"}
+
+    # 3) Запуск SAM-2
     payload = {
         "model": "meta/sam-2",
         "input": {
-            "image": data_url,
+            "image": img_url,
             "points": [[int(x), int(y)]],
             "labels": [1],
             "multimask_output": bool(int(multimask))
@@ -259,7 +276,7 @@ async def sam_point(
     if not get_url:
         return {"error": f"Unexpected Replicate response (no get url): {pred}"}
 
-    # 3) Полінг
+    # 4) Полінг
     status = pred.get("status")
     t0 = time.time()
     while status in ("starting", "processing"):
@@ -275,7 +292,7 @@ async def sam_point(
     if status != "succeeded":
         return {"error": f"SAM failed: status={status}, detail={pred}"}
 
-    # 4) Дістати маску
+    # 5) Дістати маску
     output = pred.get("output")
     mask_url = None
     if isinstance(output, dict):
@@ -290,7 +307,6 @@ async def sam_point(
         if isinstance(output[0], str) and output[0].startswith("http"):
             mask_url = output[0]
         elif isinstance(output[0], str) and output[0].startswith("data:image"):
-            # модель віддала data URL → повернемо base64 частину одразу
             try:
                 return {"mask_png_base64": output[0].split(",", 1)[1]}
             except Exception:
