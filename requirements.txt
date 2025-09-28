@@ -6,3 +6,4 @@ opencv-python-headless
 python-multipart
 scikit-image
 scikit-learn
+requests
