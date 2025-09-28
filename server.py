@@ -220,12 +220,15 @@ async def sam_point(
         im.save(buf, format="PNG"); buf.seek(0)
 
         # 2) Завантажити файл у Replicate
-        up = requests.post(
-            "https://api.replicate.com/v1/files",
-            headers={"Authorization": f"Token {token}"},
-            files={"file": ("image.png", buf.getvalue(), "image/png")},
-            timeout=120,
-        )
+        buf.seek(0)  # ВАЖЛИВО: на початок!
+files = {"file": ("image.png", buf, "image/png")}  # передаємо файловий об’єкт, не bytes
+
+up = requests.post(
+    "https://api.replicate.com/v1/files",
+    headers={"Authorization": f"Token {token}"},
+    files=files,
+    timeout=120,
+)
         if not up.ok:
             return {"error": f"Replicate file upload failed: {up.status_code} {up.text}"}
         img_url = up.json().get("url")
