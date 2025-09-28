@@ -1,5 +1,5 @@
 # server.py
-import io, os, time, base64, traceback, json
+import io, os, time, base64, json, traceback
 import requests
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form
@@ -14,7 +14,7 @@ from skimage.segmentation import slic
 from sklearn.neighbors import NearestCentroid
 
 # ================== FastAPI ==================
-app = FastAPI(title="Car Color API", version="0.3.1")
+app = FastAPI(title="Car Color API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +40,7 @@ def mask_to_png_base64(mask_uint8: np.ndarray) -> str:
     Image.fromarray(mask_uint8).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# ================== Debug / Health ==================
+# ================== Health ==================
 @app.get("/env_check")
 def env_check():
     return {"has_token": bool(os.environ.get("REPLICATE_API_TOKEN"))}
@@ -196,7 +196,7 @@ async def grow_similar(
 
     return {"mask_png_base64": mask_to_png_base64(kept)}
 
-# ================== /sam_point (AI через Replicate: upload file) ==================
+# ================== /sam_point (AI через Replicate, без /v1/files) ==================
 @app.post("/sam_point")
 async def sam_point(
     image: UploadFile = File(...),
@@ -205,51 +205,33 @@ async def sam_point(
     multimask: int = Form(0),
 ):
     """
-    SAM через Replicate. Відправляємо PNG як файл через /v1/files (правильний upload),
-    далі запускаємо предікшн. Є ретраї на 502/429. Потрібна REPLICATE_API_TOKEN.
+    SAM через Replicate БЕЗ /v1/files:
+    надсилаємо image як data:image/png;base64,....
+    Стабільніше, ніж аплоад файлу. Потрібна REPLICATE_API_TOKEN.
     """
     token = os.environ.get("REPLICATE_API_TOKEN")
     if not token:
         return {"error": "Missing REPLICATE_API_TOKEN (Render → Settings → Environment)"}
 
     try:
-        # 1) Зчитати зображення, зменшити до макс 1280px, зберегти в буфер PNG
+        # 1) Зчитати, зменшити (макс 1280px), перетворити в data URL
         raw = image.file.read()
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         W, H = im.size
-        max_side = max(W, H)
-        if max_side > 1280:
-            scale = 1280 / max_side
-            im = im.resize((int(W*scale), int(H*scale)), Image.LANCZOS)
+        m = max(W, H)
+        if m > 1280:
+            s = 1280 / m
+            im = im.resize((int(W*s), int(H*s)), Image.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, format="PNG")
-        buf.seek(0)  # обов'язково перед відправкою
+        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
         return {"error": f"Bad image: {e}"}
 
-    # 2) Upload у Replicate (правильний files=..., щоб не було 'Missing content')
-    try:
-        files = {"file": ("image.png", buf, "image/png")}
-        up = requests.post(
-            "https://api.replicate.com/v1/files",
-            headers={"Authorization": f"Token {token}"},
-            files=files,
-            timeout=120,
-        )
-        if not up.ok:
-            return {"error": f"Replicate file upload failed: {up.status_code} {up.text}"}
-        rj = up.json()
-        img_url = rj.get("url")
-        if not img_url:
-            return {"error": f"Replicate file upload returned no URL: {rj}"}
-    except Exception as e:
-        return {"error": f"Upload to Replicate failed: {e}"}
-
-    # 3) Запуск SAM-2
     payload = {
-        "model": "meta/sam-2",
+        "model": "meta/sam-2",   # alias SAM-2 у Replicate
         "input": {
-            "image": img_url,
+            "image": data_url,
             "points": [[int(x), int(y)]],
             "labels": [1],
             "multimask_output": bool(int(multimask))
@@ -257,17 +239,14 @@ async def sam_point(
     }
     headers = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
 
-    def start_prediction():
+    # 2) Старт предікшна + короткий ретрай на 502/429
+    def start():
         return requests.post("https://api.replicate.com/v1/predictions",
                              headers=headers, data=json.dumps(payload), timeout=120)
-
-    r = start_prediction()
-    for _ in range(2):
-        if r.status_code in (502, 429):
-            time.sleep(2.0)
-            r = start_prediction()
-        else:
-            break
+    r = start()
+    if r.status_code in (502, 429):
+        time.sleep(2.0)
+        r = start()
     if not r.ok:
         return {"error": f"Replicate start failed: {r.status_code} {r.text}"}
 
@@ -276,7 +255,7 @@ async def sam_point(
     if not get_url:
         return {"error": f"Unexpected Replicate response (no get url): {pred}"}
 
-    # 4) Полінг
+    # 3) Полінг статусу
     status = pred.get("status")
     t0 = time.time()
     while status in ("starting", "processing"):
@@ -292,25 +271,25 @@ async def sam_point(
     if status != "succeeded":
         return {"error": f"SAM failed: status={status}, detail={pred}"}
 
-    # 5) Дістати маску
+    # 4) Витягти маску
     output = pred.get("output")
     mask_url = None
     if isinstance(output, dict):
         if "masks" in output:
-            m = output["masks"]
-            mask_url = m[0] if isinstance(m, list) else m
+            m = output["masks"]; mask_url = m[0] if isinstance(m, list) else m
         elif "mask" in output:
             mask_url = output["mask"]
         elif "segmentation" in output:
             mask_url = output["segmentation"]
     elif isinstance(output, list) and output:
-        if isinstance(output[0], str) and output[0].startswith("http"):
-            mask_url = output[0]
-        elif isinstance(output[0], str) and output[0].startswith("data:image"):
+        val = output[0]
+        if isinstance(val, str) and val.startswith("data:image"):
             try:
-                return {"mask_png_base64": output[0].split(",", 1)[1]}
+                return {"mask_png_base64": val.split(",", 1)[1]}
             except Exception:
                 pass
+        if isinstance(val, str) and val.startswith("http"):
+            mask_url = val
 
     if not mask_url:
         return {"error": f"Cannot find mask url in output: {output}"}
