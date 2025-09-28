@@ -1,18 +1,20 @@
 # server.py
-import io, os, time, base64, traceback, requests
+import io, os, time, base64, traceback, json
+import requests
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import cv2
 
-# ML
+# ML / обробка
 from skimage.color import rgb2lab
 from skimage.feature import local_binary_pattern
 from skimage.segmentation import slic
 from sklearn.neighbors import NearestCentroid
 
-app = FastAPI(title="Car Color API", version="0.2.0")
+# ================== FastAPI ==================
+app = FastAPI(title="Car Color API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,7 +22,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# ----------------- helpers -----------------
+# ================== Helpers ==================
 def read_image(file: UploadFile) -> np.ndarray:
     data = file.file.read()
     return np.array(Image.open(io.BytesIO(data)).convert("RGB"))
@@ -38,7 +40,7 @@ def mask_to_png_base64(mask_uint8: np.ndarray) -> str:
     Image.fromarray(mask_uint8).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-# --------------- health/debug ---------------
+# ================== Debug / Health ==================
 @app.get("/env_check")
 def env_check():
     return {"has_token": bool(os.environ.get("REPLICATE_API_TOKEN"))}
@@ -69,8 +71,8 @@ async def refine(
     bgdModel = np.zeros((1, 65), np.float64)
     fgdModel = np.zeros((1, 65), np.float64)
     cv2.grabCut(img_roi, gc_mask, None, bgdModel, fgdModel, 8, cv2.GC_INIT_WITH_MASK)
-    result = np.where((gc_mask == 1) | (gc_mask == 3), 255, 0).astype('uint8')
 
+    result = np.where((gc_mask == 1) | (gc_mask == 3), 255, 0).astype('uint8')
     k = np.ones((3,3), np.uint8)
     result = cv2.morphologyEx(result, cv2.MORPH_OPEN,  k, iterations=1)
     result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, k, iterations=2)
@@ -80,7 +82,7 @@ async def refine(
     full[y0:y1, x0:x1] = result
     return {"mask_png_base64": mask_to_png_base64(full)}
 
-# ============== /grow_similar (evristics) ==============
+# ============== /grow_similar (евристики) ==============
 @app.post("/grow_similar")
 async def grow_similar(
     image: UploadFile = File(...),
@@ -93,10 +95,12 @@ async def grow_similar(
     band_margin: float = Form(0.18),
     keep_k: int = Form(4),
 ):
+    """Пошук схожих деталей: SLIC + колір (Lab) + текстура (LBP) + фільтри по площі/висоті."""
     img  = read_image(image)
     rough= read_mask(mask, img.shape[:2])
     H, W = rough.shape
 
+    # Seeds
     k_pos = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11,11))
     k_neg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21,21))
     seed_pos = cv2.erode(rough, k_pos)
@@ -108,6 +112,7 @@ async def grow_similar(
         return {"mask_png_base64": mask_to_png_base64(rough)}
     x0, x1 = xs.min(), xs.max(); y0, y1 = ys.min(), ys.max()
 
+    # Допустима зона + дзеркало
     mx = int(W * float(band_margin)); my = int(H * float(band_margin))
     x0b = max(0, x0 - mx); x1b = min(W, x1 + mx)
     y0b = max(0, y0 - my); y1b = min(H, y1 + my)
@@ -117,6 +122,7 @@ async def grow_similar(
         xm0 = max(0, W - x1b); xm1 = min(W, W - x0b)
         allowed[y0b:y1b, xm0:xm1] = 255
 
+    # Суперпікселі
     seg = slic(img, n_segments=int(segments), compactness=25, start_label=0)
     n = seg.max() + 1
 
@@ -190,7 +196,7 @@ async def grow_similar(
 
     return {"mask_png_base64": mask_to_png_base64(kept)}
 
-# ================== /sam_point (AI) ==================
+# ================== /sam_point (AI через Replicate) ==================
 @app.post("/sam_point")
 async def sam_point(
     image: UploadFile = File(...),
@@ -199,7 +205,8 @@ async def sam_point(
     multimask: int = Form(0),
 ):
     """
-    SAM через Replicate: фото + одна точка. Повертає PNG маску (base64).
+    SAM через Replicate без /v1/files:
+    відправляємо зображення як data URL (base64). Є ретраї на 502/429.
     Потрібна змінна середовища REPLICATE_API_TOKEN.
     """
     token = os.environ.get("REPLICATE_API_TOKEN")
@@ -207,7 +214,7 @@ async def sam_point(
         return {"error": "Missing REPLICATE_API_TOKEN (Render → Settings → Environment)"}
 
     try:
-        # 1) Прочитати зображення і зменшити до макс 1280 по довшій стороні
+        # 1) Зчитати, зменшити (макс 1280px), закодувати в data URL
         raw = image.file.read()
         im = Image.open(io.BytesIO(raw)).convert("RGB")
         W, H = im.size
@@ -215,95 +222,91 @@ async def sam_point(
         if max_side > 1280:
             scale = 1280 / max_side
             im = im.resize((int(W*scale), int(H*scale)), Image.LANCZOS)
-
         buf = io.BytesIO()
-        im.save(buf, format="PNG"); buf.seek(0)
-
-        # 2) Завантажити файл у Replicate
-        buf.seek(0)  # ВАЖЛИВО: на початок!
-files = {"file": ("image.png", buf, "image/png")}  # передаємо файловий об’єкт, не bytes
-
-up = requests.post(
-    "https://api.replicate.com/v1/files",
-    headers={"Authorization": f"Token {token}"},
-    files=files,
-    timeout=120,
-)
-        if not up.ok:
-            return {"error": f"Replicate file upload failed: {up.status_code} {up.text}"}
-        img_url = up.json().get("url")
-        if not img_url:
-            return {"error": f"Replicate file upload returned no URL: {up.text}"}
-
-        # 3) Запустити предікт (SAM-2 alias)
-        payload = {
-            "model": "meta/sam-2",
-            "input": {
-                "image": img_url,
-                "points": [[int(x), int(y)]],
-                "labels": [1],
-                "multimask_output": bool(int(multimask)),
-            },
-        }
-        run = requests.post(
-            "https://api.replicate.com/v1/predictions",
-            headers={"Authorization": f"Token {token}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=120,
-        )
-        if not run.ok:
-            return {"error": f"Replicate start failed: {run.status_code} {run.text}"}
-        pred = run.json()
-        get_url = pred.get("urls", {}).get("get")
-        if not get_url:
-            return {"error": f"Unexpected Replicate response (no get url): {pred}"}
-
-        # 4) Полінг
-        status = pred.get("status"); t0 = time.time()
-        while status in ("starting", "processing"):
-            if time.time() - t0 > 300:
-                return {"error": "Timeout waiting for Replicate (5 min)"}
-            time.sleep(1.5)
-            rr = requests.get(get_url, headers={"Authorization": f"Token {token}"}, timeout=120)
-            if not rr.ok:
-                return {"error": f"Replicate poll failed: {rr.status_code} {rr.text}"}
-            pred = rr.json()
-            status = pred.get("status")
-
-        if status != "succeeded":
-            return {"error": f"SAM failed: status={status}, detail={pred}"}
-
-        # 5) Дістати URL маски
-        output = pred.get("output")
-        mask_url = None
-        if isinstance(output, dict):
-            if "masks" in output:
-                m = output["masks"]
-                mask_url = m[0] if isinstance(m, list) else m
-            elif "mask" in output:
-                mask_url = output["mask"]
-            elif "segmentation" in output:
-                mask_url = output["segmentation"]
-        if not mask_url and isinstance(output, list) and len(output) > 0:
-            if isinstance(output[0], str) and output[0].startswith("http"):
-                mask_url = output[0]
-        if not mask_url:
-            return {"error": f"Cannot find mask url in output: {output}"}
-
-        mask_png = requests.get(mask_url, timeout=120)
-        if not mask_png.ok:
-            return {"error": f"Download mask failed: {mask_png.status_code} {mask_png.text}"}
-
-        b64 = base64.b64encode(mask_png.content).decode("utf-8")
-        return {"mask_png_base64": b64}
-
+        im.save(buf, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
-        # повертаємо текст помилки і пишемо стек у логи Render
-        print("=== ERROR in /sam_point ===")
-        print(traceback.format_exc())
-        return {"error": str(e)}
+        return {"error": f"Bad image: {e}"}
 
-# ------------- local run -------------
+    # 2) Запуск предікшна
+    payload = {
+        "model": "meta/sam-2",
+        "input": {
+            "image": data_url,
+            "points": [[int(x), int(y)]],
+            "labels": [1],
+            "multimask_output": bool(int(multimask))
+        }
+    }
+    headers = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
+
+    def start_prediction():
+        return requests.post("https://api.replicate.com/v1/predictions",
+                             headers=headers, data=json.dumps(payload), timeout=120)
+
+    r = start_prediction()
+    for _ in range(2):
+        if r.status_code in (502, 429):
+            time.sleep(2.0)
+            r = start_prediction()
+        else:
+            break
+    if not r.ok:
+        return {"error": f"Replicate start failed: {r.status_code} {r.text}"}
+
+    pred = r.json()
+    get_url = pred.get("urls", {}).get("get")
+    if not get_url:
+        return {"error": f"Unexpected Replicate response (no get url): {pred}"}
+
+    # 3) Полінг
+    status = pred.get("status")
+    t0 = time.time()
+    while status in ("starting", "processing"):
+        if time.time() - t0 > 300:
+            return {"error": "Timeout waiting for Replicate"}
+        time.sleep(1.5)
+        rr = requests.get(get_url, headers={"Authorization": f"Token {token}"}, timeout=120)
+        if not rr.ok:
+            return {"error": f"Replicate poll failed: {rr.status_code} {rr.text}"}
+        pred = rr.json()
+        status = pred.get("status")
+
+    if status != "succeeded":
+        return {"error": f"SAM failed: status={status}, detail={pred}"}
+
+    # 4) Дістати маску
+    output = pred.get("output")
+    mask_url = None
+    if isinstance(output, dict):
+        if "masks" in output:
+            m = output["masks"]
+            mask_url = m[0] if isinstance(m, list) else m
+        elif "mask" in output:
+            mask_url = output["mask"]
+        elif "segmentation" in output:
+            mask_url = output["segmentation"]
+    elif isinstance(output, list) and output:
+        if isinstance(output[0], str) and output[0].startswith("http"):
+            mask_url = output[0]
+        elif isinstance(output[0], str) and output[0].startswith("data:image"):
+            # модель віддала data URL → повернемо base64 частину одразу
+            try:
+                return {"mask_png_base64": output[0].split(",", 1)[1]}
+            except Exception:
+                pass
+
+    if not mask_url:
+        return {"error": f"Cannot find mask url in output: {output}"}
+
+    try:
+        mp = requests.get(mask_url, timeout=120)
+        mp.raise_for_status()
+        return {"mask_png_base64": base64.b64encode(mp.content).decode("utf-8")}
+    except Exception as e:
+        return {"error": f"Download mask failed: {e}"}
+
+# ================== Local run ==================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=10000, reload=True)
