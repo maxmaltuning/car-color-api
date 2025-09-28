@@ -1,3 +1,4 @@
+import os, requests
 @app.post("/grow_similar")
 async def grow_similar(
     image: UploadFile = File(...),
